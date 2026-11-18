@@ -418,9 +418,10 @@ jobs:
 
       - name: Verify SUSFS and SukiSU are compiled in
         run: |
-          strings -a kernel/out/arch/arm64/boot/Image | grep -m1 'susfs is initialized' \
+          strings -a kernel/out/arch/arm64/boot/Image > "$RUNNER_TEMP/image.strings"
+          grep -m1 'susfs is initialized' "$RUNNER_TEMP/image.strings" \
             || { echo "SUSFS tidak ikut ter-compile"; exit 1; }
-          strings -a kernel/out/arch/arm64/boot/Image | grep -q 'com.sukisu.ultra' \
+          grep -m1 'KernelSU: ' "$RUNNER_TEMP/image.strings" \
             || { echo "SukiSU tidak ikut ter-compile"; exit 1; }
 
       - name: Package AnyKernel3 zip
