@@ -85,12 +85,27 @@ jobs:
           {
           	return 0;
           }
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+          /* sus_path_uid_filter is newer than this backport: sus paths stay hidden from all non-su apps. */
+          void susfs_parse_sus_path_app_strings(void)
+          {
+          }
+
+          void susfs_set_sus_path_uid_filter(void __user **user_info)
+          {
+          }
+          #endif
           """
           p.write_text(t)
+          d = pathlib.Path("include/linux/susfs_def.h"); t = d.read_text()
+          m = "#define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55553\n"
+          assert t.count(m) == 1
+          d.write_text(t.replace(m, m + "#ifndef CMD_SUSFS_SET_SUS_PATH_UID_FILTER\n#define CMD_SUSFS_SET_SUS_PATH_UID_FILTER 0x55554\n#endif\n"))
           h = pathlib.Path("include/linux/susfs.h"); t = h.read_text()
           m = "/* susfs_init */\nvoid susfs_init(void);"
           assert t.count(m) == 1
-          h.write_text(t.replace(m, "/* string helpers used by SukiSU */\nbool susfs_starts_with(const char *str, const char *prefix);\nbool susfs_ends_with(const char *str, const char *suffix);\n\n" + m))
+          h.write_text(t.replace(m, "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\nvoid susfs_parse_sus_path_app_strings(void);\nvoid susfs_set_sus_path_uid_filter(void __user **user_info);\n#endif\n\n/* string helpers used by SukiSU */\nbool susfs_starts_with(const char *str, const char *prefix);\nbool susfs_ends_with(const char *str, const char *suffix);\n\n" + m))
           PYEOF
           cat > "$RUNNER_TEMP/hooks.b64" <<'B64EOF'
           H4sICAU5/WoCA3N1c2ZzLWhvb2tzLnBhdGNoAOw8aXPbRpafqV/RTra0pERSvElZkWe0FuWwrMOr
@@ -346,6 +361,8 @@ jobs:
           ohiScfssRqUWGScs2sISvJQOr7dc+NNkhAZu/mDgz/3haMwa3fjm/wCh7QY2sfAAAA==
           B64EOF
           base64 -d "$RUNNER_TEMP/hooks.b64" | gunzip > "$RUNNER_TEMP/susfs-hooks.patch"
+          echo "531d15ea6431721f0c8e9136a455bd4b42f0abbb67fe6087fad5c7437f021ceb  $RUNNER_TEMP/susfs-hooks.patch" | sha256sum -c - \
+            || { echo "Patch rusak: ada karakter yang salah saat copy-paste blok base64."; exit 1; }
           patch -p1 -F3 --no-backup-if-mismatch < "$RUNNER_TEMP/susfs-hooks.patch" \
             || { echo "Patch hook SUSFS tidak lagi menempel di kernel LineageOS terbaru (ROM berubah)."; exit 1; }
           find . -name '*.rej' | grep . && { echo "ada hunk yang gagal"; exit 1; } || true
