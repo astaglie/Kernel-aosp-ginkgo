@@ -10,10 +10,14 @@ name: Build ginkgo kernel (LineageOS + SukiSU Ultra + SUSFS)
 # (gzip+base64). Patch dibuat terhadap lineage-24.0 commit 8aaa002bf; kalau ROM
 # update dan patch tidak lagi menempel, workflow berhenti dengan pesan jelas.
 #
-# Diuji lokal (clang 18): build penuh sampai Image.gz lolos, release string persis
-# 4.14.357-openela-perf-g8aaa002bfb7b, "susfs ... version: v2.2.0" dan SukiSU ada
-# di dalam kernel. BELUM diuji: boot di HP, SUSFS berfungsi di runtime, dan
-# workflow ini di GitHub Actions. Fitur sus_type / avd (SUSFS 2.2.1+) hanya stub.
+# KPM: SukiSU hanya mengaktifkan KPM di kernel 5.10+. Di sini batas itu dilonggarkan
+# ke 4.14 dan Image dipatch KernelPatch (kptools) sebelum dipaketkan.
+#
+# Diuji lokal (clang 18): build penuh sampai Image lolos, release string persis
+# 4.14.357-openela-perf-g8aaa002bfb7b, SUSFS v2.2.0 + SukiSU + KPM ada di dalam
+# kernel, kptools berhasil mem-patch Image. BELUM diuji: boot di HP, SUSFS/KPM
+# berfungsi di runtime (KernelPatch di kernel 4.14 paling berisiko), dan workflow
+# ini di GitHub Actions. Fitur SUSFS sus_type / avd / sus_path_uid_filter hanya stub.
 
 on:
   workflow_dispatch:
@@ -37,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu flex bison bc \
-            libssl-dev libelf-dev cpio lz4 zip dwarves
+            libssl-dev libelf-dev cpio lz4 zip dwarves cmake
 
       - name: Fetch kernel (LineageOS)
         uses: actions/checkout@v4
@@ -377,6 +381,22 @@ jobs:
           sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           grep -n kernelsu drivers/Makefile drivers/Kconfig
 
+      - name: Enable KPM on 4.14
+        run: |
+          python3 -I - kernel <<'PYEOF'
+          import pathlib, re, sys
+          p = pathlib.Path(sys.argv[1]) / "KernelSU/kernel/kernel_compat.h"
+          t = p.read_text()
+          if "KSU_CAN_USE_KPM" not in t:
+              print("upstream no longer has a KPM version gate, nothing to do")
+          elif re.search(r"KERNEL_VERSION\(4, 14, 0\)\n#define KSU_CAN_USE_KPM", t):
+              print("KPM gate already allows 4.14")
+          else:
+              n, c = re.subn(r"KERNEL_VERSION\(5, 10, 0\)(\n#define KSU_CAN_USE_KPM)", r"KERNEL_VERSION(4, 14, 0)\1", t)
+              if c != 1: sys.exit("KPM version gate changed upstream, update this step")
+              p.write_text(n); print("KPM gate relaxed to 4.14")
+          PYEOF
+
       - name: Configure (same fragments the ROM build uses)
         working-directory: kernel
         run: |
@@ -386,7 +406,7 @@ jobs:
           KCONFIG_CONFIG=out/.config scripts/kconfig/merge_config.sh -m -O out out/.config \
             $CF/xiaomi-trinket.config $CF/ginkgo.config
           scripts/config --file out/.config --disable LOCALVERSION_AUTO \
-            --enable KSU --enable KSU_SUSFS \
+            --enable KSU --enable KPM --enable KSU_SUSFS \
             --enable KSU_SUSFS_SUS_PATH --enable KSU_SUSFS_SUS_MOUNT --enable KSU_SUSFS_SUS_KSTAT \
             --enable KSU_SUSFS_SPOOF_UNAME --enable KSU_SUSFS_ENABLE_LOG \
             --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
@@ -394,7 +414,7 @@ jobs:
             --disable KSU_SUSFS_PRIORITY_UID_FILTER
           $MK olddefconfig
           grep -E '^(# )?CONFIG_(KSU|LOCALVERSION)[A-Z_]*[= ]' out/.config
-          for o in KSU KSU_SUSFS KSU_SUSFS_INLINE_HOOK KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_PATH; do
+          for o in KSU KPM KSU_SUSFS KSU_SUSFS_INLINE_HOOK KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_PATH; do
             grep -q "^CONFIG_$o=y" out/.config || { echo "CONFIG_$o tidak aktif"; exit 1; }
           done
           H=$(git rev-parse HEAD | cut -c1-12)
@@ -423,6 +443,29 @@ jobs:
             || { echo "SUSFS tidak ikut ter-compile"; exit 1; }
           grep -m1 'KernelSU: ' "$RUNNER_TEMP/image.strings" \
             || { echo "SukiSU tidak ikut ter-compile"; exit 1; }
+          grep -q 'extension/kpm' "$RUNNER_TEMP/image.strings" \
+            || { echo "KPM tidak ikut ter-compile"; exit 1; }
+
+      - name: Patch Image with KernelPatch (required for KPM)
+        run: |
+          git clone --depth 1 https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch "$RUNNER_TEMP/kp"
+          KP="$RUNNER_TEMP/kp"
+          echo "KernelPatch $(git -C "$KP" rev-parse --short HEAD)"
+          # The kernel's KPM bridge and kpimg must speak the same ABI version.
+          A=$(grep -rhoE 'define SUKISU_KPM_ABI_VERSION +[0-9]+' kernel/KernelSU/kernel/extension/kpm/bridge.h | awk '{print $3}')
+          B=$(grep -rhoE 'define SUKISU_KPM_ABI_VERSION +[0-9]+' "$KP/kernel/patch/sukisu" | awk '{print $3}' | head -1)
+          echo "KPM ABI: kernel=$A kernelpatch=$B"
+          [ -n "$A" ] && [ "$A" = "$B" ] || { echo "KPM ABI mismatch"; exit 1; }
+          cmake -S "$KP/tools" -B "$KP/tools/build" > /dev/null
+          cmake --build "$KP/tools/build" -j"$(nproc)" > /dev/null
+          (cd "$KP/kernel" && TARGET_COMPILE=aarch64-linux-gnu- ANDROID=1 \
+            make kpimg -j"$(nproc)" CC="aarch64-linux-gnu-gcc -fno-stack-protector -fno-pie" > /dev/null)
+          IMG=kernel/out/arch/arm64/boot/Image
+          "$KP/tools/build/kptools" -p -i "$IMG" -k "$KP/kernel/kpimg" -s "$(openssl rand -hex 12)" -o "$RUNNER_TEMP/Image.kp" | tail -3
+          [ "$(stat -c%s "$RUNNER_TEMP/Image.kp")" -gt "$(stat -c%s "$IMG")" ] || { echo "patched Image not larger"; exit 1; }
+          strings -a "$RUNNER_TEMP/Image.kp" > "$RUNNER_TEMP/kp.strings"
+          grep -q 'KernelPatch Version' "$RUNNER_TEMP/kp.strings" || { echo "kpimg not embedded"; exit 1; }
+          gzip -9 -n -c "$RUNNER_TEMP/Image.kp" > "$RUNNER_TEMP/Image.gz"
 
       - name: Package AnyKernel3 zip
         run: |
@@ -434,7 +477,7 @@ jobs:
           # Does NOT back up the stock boot image: save your own boot.img first.
 
           properties() { '
-          kernel.string=Ginkgo LineageOS kernel with SukiSU Ultra (SUSFS v2.2.0, no KPM)
+          kernel.string=Ginkgo LineageOS kernel with SukiSU Ultra (SUSFS v2.2.0, KPM)
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -465,7 +508,7 @@ jobs:
           dump_boot;
           write_boot;
           AKEOF
-          cp kernel/out/arch/arm64/boot/Image.gz "$RUNNER_TEMP/ak3/Image.gz"
+          cp "$RUNNER_TEMP/Image.gz" "$RUNNER_TEMP/ak3/Image.gz"
           cd "$RUNNER_TEMP/ak3"
           rm -rf .git .github README.md
           zip -r9 "$GITHUB_WORKSPACE/ginkgo-lineage-sukisu-susfs-$(date +%Y%m%d).zip" . -x '*.git*'
